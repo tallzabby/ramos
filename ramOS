@@ -1,0 +1,491 @@
+#!/bin/bash
+
+function checkReadOnlyRoot(){
+  if ! echo > /rw_test; then echo "$(date) - filesystem is in read only"; exit; fi
+}
+
+#inputs requires: rootSystemPartition, oldRootDir (/oldroot was typically used as input)
+function unMountRoot(){
+  local __supressExit='false'
+  if [[ "$1" == '--supressexit' ]]; then __supressExit='true'; shift; fi
+  local __rootSystemPartition="$1" __oldRootDir="$2" __stepDelay __finalDelay  __fuserCount __count rc
+
+  echo "$(date) - unMountRoot function started.  __rootSystemPartition is ($__rootSystemPartition), oldRootDir is ($__oldRootDir), __supressExit ($__supressExit)."
+
+  #this loop is for unmounting the root partition, it will attempt multiple times with various delays because it can be a bit fuzzy in rare circumstances
+  for x in {0..4}; do
+    __stepDelay=( '1' '0.1' '5' '15' '1' )
+    __finalDelay=( '10' '10' '20' '30' '1' )
+    echo "$(date) - Stopping SSHD"
+
+    #auditd was not in instructions online, but is required to shut down if you ever want to remount anything again
+    echo "$(date) - Double checking certain services have stopped"
+    service crond stop
+    service auditd stop
+    service sshd stop
+
+    echo "$(date) - Killing anything that might be holding one to the old file system"
+	killall mingetty; sleep 1; killall udevd; sleep 1; 
+	echo "$(date) reexec daemon" #re-execute so that PID 0 is not bound to the old filesystem
+	
+	systemctl daemon-reexec  
+    
+
+    echo "$(date) - Current active processes on ($__oldRootDir/dev) are:"
+    fuser -vm $__oldRootDir/dev
+    echo "$(date) - Current active processes on ($__oldRootDir/proc) are:"
+    fuser -vm $__oldRootDir/proc
+    echo "$(date) - Killing processes"
+    fuser -vmk $__oldRootDir/dev
+    fuser -vmk $__oldRootDir/proc
+    #__oldRootDir=/oldroot; fuser -vmk $__oldRootDir/dev; fuser -vmk $__oldRootDir/proc
+    #__oldRootDir=/oldroot; fuser -vm $__oldRootDir/dev; fuser -vm $__oldRootDir/proc
+
+    if [ $(fuser -vm $__oldRootDir/dev 2>&1 | grep -vi 'Cannot stat' | wc -l ) -gt 0 ]; then 
+      sleep 1
+      for __count in {1..4}; do
+        if [ $__count -eq 4 ]; then 
+          echo "Error - processes are still holding dev after ($(($__count-1))) tries"; fuser -vm $__oldRootDir/dev 
+          if [[ "$__supressExit" != 'true' ]]; then exit 1; fi
+        fi
+        __fuserCount="$(fuser -vm $__oldRootDir/dev 2>&1 | grep -vi 'Cannot stat' | wc -l )"
+        if [ $__fuserCount -gt 0 ] && ! ( [ $__fuserCount -lt 3 ] && fuser -vm $__oldRootDir/dev 2>&1 | grep -i mount ); then 
+          echo "Notice - processes are still holding dev after ($__count) tries"; fuser -vm $__oldRootDir/dev; sleep 0.1; fuser -vmk $__oldRootDir/dev
+          if [[ "$deviceOS" != 'centos6' ]]; then /usr/sbin/sshd; fi
+        else break; fi
+      done
+    fi
+
+    umount $__oldRootDir/proc; umount $__oldRootDir/dev/pts; umount $__oldRootDir/selinux; umount $__oldRootDir/sys; umount $__oldRootDir/var/lib/nfs/rpc_pipefs
+    #__oldRootDir=/oldroot; umount $__oldRootDir/proc; umount $__oldRootDir/dev/pts; umount $__oldRootDir/selinux; umount $__oldRootDir/sys; umount $__oldRootDir/var/lib/nfs/rpc_pipefs
+
+    # umount -l $__oldRootDir/proc; umount -l $__oldRootDir/dev/pts; umount -l $__oldRootDir/selinux; umount -l $__oldRootDir/sys; umount -l $__oldRootDir/var/lib/nfs/rpc_pipefs
+    
+    echo "$(date) - Current active processes on ($__oldRootDir/dev) are:"
+    fuser -vm $__oldRootDir/dev
+    lsof | grep oldroot
+    echo "$(date) - Killing remaining processes"
+    fuser -vmk $__oldRootDir/dev
+    sleep 5.1
+
+    echo "$(date) - unmounting boot, dev, proc"
+    umount $__oldRootDir/boot; umount $__oldRootDir/dev; umount $__oldRootDir/proc; sleep 1
+
+    echo "$(date) - unmount ($__oldRootDir)"
+    umount $__oldRootDir; sleep 1
+
+    echo  "$(date) - Attempting umount of rootSystemPartition ($__rootSystemPartition)"
+    umount $__oldRootDir/dev; umount $__oldRootDir/proc; umount $__oldRootDir;  sleep 1
+    umount -l $__oldRootDir/dev; umount -l $__oldRootDir/proc; umount -l  $__oldRootDir;  sleep 1
+    
+
+    umount $__rootSystemPartition; sleep 3; 
+    if ! echo test > /test.temp; then #Sometimes the filesystem will go read-only at this mount, so i will force remount it as rw
+      echo "$(date) - Notice, file system went into read-only mode, remounting as read-write mode"
+      mount -o remount,rw /; sleep 1
+      checkReadOnlyRoot
+    fi 
+    rm -f /test.temp &> /dev/null
+    echo "$(date) - Force removing any mounted drive from mtab, it might not always get removed so we are forcing it." #note that LVM code is hardcoded
+    sed -i '/sda/d' /etc/mtab; sed -i "/$__rootSystemPartition/d" /etc/mtab; 
+
+    
+
+    #if ! echo test > /test.temp; then echo "$(date) - Notice, file system went into read-only mode, remounting as read-write mode"; mount -o remount,rw /; sleep 1; fi 
+    checkReadOnlyRoot
+    #umount -l $__oldRootDir/dev; umount -l $__oldRootDir/proc; umount $__oldRootDir; umount -l $__oldRootDir; sleep 3; 
+    #if [[ "$__deviceOS" == 'centos6' ]]; then mount none /proc -t proc; fi
+    #service sshd restart
+    #fuser -vm $__rootSystemPartition
+    #fuser -vmk $__rootSystemPartition
+    #fuser -vm $__oldRootDir/dev
+    #sleeps are mandatory, umount appears to take a few seconds after officially executing
+    #fuser -vmk $__oldRootDir/dev
+
+    sleep ${__stepDelay[$x]}
+    umount $__rootSystemPartition
+    sleep ${__stepDelay[$x]}
+    sleep ${__stepDelay[$x]}
+
+    checkReadOnlyRoot
+
+    echo "$(date) - Running file system check on ($__rootSystemPartition)"
+    $scriptLocation/e2fsck -fy $__rootSystemPartition; rc=$?
+    if [ "$rc" -ne 0 ]; then 
+      fsck -fy $__rootSystemPartition; rc=$? #do error code check (exit down there after retries)
+      if [ "$rc" -eq 0 ]; then break; fi
+    else
+      break
+    fi
+
+    checkReadOnlyRoot
+    sleep ${__finalDelay[$x]}
+  done
+}
+
+
+#requires getOS toLowerCase 
+function getIP {
+    local __OSType=$(getOS)
+    local __interface="bad" __rc __altInterface='ens0' __manualInterface='false'
+
+    #let generic case (linux) use centos7 method since it is the most robust
+    if [[ "$__OSType" == 'linux' ]]; then __OSType='centos7'; fi
+    if [[ "$__OSType" == 'centos8' ]]; then __OSType='centos7'; fi
+    if [[ "$__OSType" != 'centos6' ]] && [[ "$__OSType" == *entos* ]] ; then __OSType='centos7'; fi
+
+    case $__OSType in
+    osx)
+      if [ $# -lt 1 ]; then __interface="en"
+      else __interface=$1; fi
+      if ! ifconfig $__interface &> /dev/null; then echo "Interface ($__interface) not available."; return 2; fi
+      ifconfig | grep -A4 -P '^en' | grep -oP "inet \K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}" | head -n1
+      ;;
+    #linux)
+    #  if [ $# -lt 1 ]; then __interface="eth0"
+    #  else __interface=$1; fi
+    #  if ! ifconfig $__interface &> /dev/null; then echo "Interface ($__interface) not available."; return 2; fi
+    #  ifconfig | grep -A1 $__interface | grep -oP "inet addr:\K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"; __rc=$?
+    #  if [ $__rc -ne 0 ]; then
+    #    ifconfig | grep -A1 $__interface | grep -oP "inet \K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+    #  fi
+    #  ;;
+    centos6)
+      if [ $# -lt 1 ]; then __interface="eth0"
+      else __interface=$1; fi
+      if ! ifconfig $__interface &> /dev/null; then echo "Interface ($__interface) not available."; return 2; fi
+      ifconfig | grep -A1 $__interface | grep -oP "inet addr:\K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+      ;;
+    centos7)
+      if [ $# -lt 1 ]; then __interface="eth0"
+      else __interface=$1; __manualInterface='true'; fi
+      #code for no ifconfig systems
+      if ! which ifconfig &> /dev/null; then
+          if ! ip link set $__interface up; then
+            if ip link set $__altInterface up && [[ "$__manualInterface" != 'true' ]]; then
+              ip addr | grep -A1 $__altInterface | grep inet | grep $__altInterface | grep -oP "inet[^0-9]*\K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+            else
+              echo "Interface ($__interface) $(if [[ "$__manualInterface" != 'true' ]]; then echo -n ", Interface ($__altInterface),"; fi) not available."; return 2;
+            fi
+          else
+              ip addr | grep -A1 $__interface | grep inet | grep $__interface | grep -oP "inet[^0-9]*\K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+          fi
+      else
+        if ! ifconfig $__interface &> /dev/null; then echo "Interface ($__interface) not available."; return 2; fi
+        ifconfig | grep -A1 $__interface | grep -oP "inet[^0-9]*\K([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+      fi
+      ;;
+    cygwin)
+      ipconfig | grep -i ipv4 | head -n1 | grep -oP "([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}"
+      ;;
+    *)
+      echo "Error: invalid OS argument for getIP function, note cygwin is not currently supported"
+      ;;
+    esac
+}
+
+function toLowerCase {
+        echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+#dependent on toLowerCase
+function getOS {
+    local __unameResult=$(toLowerCase $(uname))
+    if [[ $__unameResult = *"linux"* ]]; then 
+        if [ -f /etc/centos-release ]; then 
+            if [[ "$(cat /etc/centos-release)" == *"CentOS release 6"* ]] || [[ "$(cat /etc/centos-release)" == *"CentOS Linux release 6"* ]]; then echo -n "centos6" 
+            elif [[ "$(cat /etc/centos-release)" == *"CentOS release 7"* ]] || [[ "$(cat /etc/centos-release)" == *"CentOS Linux release 7"* ]]; then echo -n "centos7" 
+            elif [[ "$(cat /etc/centos-release)" == *"CentOS release 8"* ]] || [[ "$(cat /etc/centos-release)" == *"CentOS Linux release 8"* ]]; then echo -n "centos8" 
+            elif [[ "$(cat /etc/centos-release)" == *"CentOS release 9"* ]] || [[ "$(cat /etc/centos-release)" == *"CentOS Linux release 9"* ]]; then echo -n "centos9" 
+            else echo -n "linux"; fi
+        fi
+    elif [[ $__unameResult = *"darwin"* ]]; then echo -n "osx"
+    elif [[ $__unameResult = *"cygwin"* ]]; then echo -n "cygwin"
+    #else echo "linux" #fallback to linux if i can't find anything
+    fi
+}
+
+
+if [ $# -lt 1 ]; then echo -e "Usage: ramOS ramUsageinMegs fileorDir1 fileorDir2 \nWhere files and directory are copied to the root of the new RAM drive and the OS drive is unmounted"; exit; fi
+#scriptLocation="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+ramFileSystemSize=""
+postExecCommand=""
+
+for x in {1..3}; do
+	if [[ "$1" == '--supressexit' ]]; then suppressExit="$1"; shift; fi
+	[[ "$1" =~ (command=)(.*) ]]
+	if [[ ${BASH_REMATCH[1]} == "command=" ]]; then
+	    postExecCommand="${BASH_REMATCH[2]}"; shift;
+	fi
+	if [[ "$1" != *"="* ]] && [[ "$1" != *"-"* ]] && [[ "$ramFileSystemSize" == "" ]]; then
+		ramFileSystemSize="${1}m"; shift
+	fi
+done
+
+
+if [ -f /usr/local/bin/bash ] && ! [ -L /usr/local/bin/bash ]; then scriptVar='/usr/local/bin/bash '; elif [ -f /bin/bash ] && ! [ -L /bin/bash ]; then scriptVar='/bin/bash '; else echo "$(date) - ERROR, could not detect script, going to use sh and hope for the best."; scriptVar='sh'; fi
+
+ 
+if [[ "$1" == 'part2' ]]; then partVar='part2'; shift; elif [[ "$1" == 'part1' ]]; then partVar='part1'; shift; else partVar='part1'; fi
+
+if [[ "$partVar" = "part1" ]]; then 
+	deviceOS="$(getOS)"
+	ipAddress="$(getIP)"
+	if [ -f /root/partitions.info ]; then
+		echo "$(date) - Found /root/partition.info, so getting partition information from there" 
+		rootSystemPartitionMapping="$(grep -oP 'default_partition=\K.*' /root/partitions.info)"
+	else
+		LVMflag='false'
+		if [[ "$LVMflag" == 'true' ]]; then
+		    rootSystemPartitionMapping="$(cat /proc/cmdline | grep -oP 'root=\K[^ ]*')"
+		else
+			rootSystemPartitionMapping="/dev/$(readlink /dev/root)"
+			if [[ "$rootSystemPartition" == "/dev/" ]]; then
+			       rootSystemPartitionMapping="$(cat /proc/cmdline | grep -oP 'root=\K[^ ]*')"
+				if [[ "$rootSystemPartition" == *"UUID"* ]]; then 
+					justUUID="$(echo "$rootSystemPartition" | grep -oP 'UUID[^0-9A-Fa-f]+\K.*')";
+					rootSystemPartitionMapping="$(blkid | grep "$justUUID" | grep -oP '/dev/[[:alpha:]]{1,4}[[:digit:]]{1,2}')"
+				fi
+			fi
+			echo "$(date) - Detected root patition as ($rootSystemPartition) on ($(getIP))"
+		fi
+	fi
+elif [[ "$partVar" = "part2" ]]; then 
+	deviceOS="$1"; shift
+	ipAddress="$1"; shift
+	rootSystemPartitionMapping="$1"; shift
+	postExecCommand="$1"; shift
+fi
+
+#The purpose of part1 and part2, is that the script must create a RAM drive that is not on the current partition, then copy itself to it, and then re-execute.  
+#you cannot run off the current partition, if your purpose is to unmount it
+function part1 {
+	local __suppressExit=''
+	if [[ "$1" == '--supressexit' ]]; then __suppressExit="$1"; shift; fi
+
+	local  __serviceList __service __rc __jobIDs #__scriptVar
+	echo "Variables are: ramFileSystemSize ($ramFileSystemSize), deviceOS ($deviceOS), ipAddress ($ipAddress), rootSystemPartitionMapping ($rootSystemPartitionMapping), postExecCommand ($postExecCommand)), __suppressExit ($__suppressExit)."
+	echo "Input is ($@), a total number of ($#) elements"
+	echo "$(date) - Setting crontab command to recover default settings"
+	safeappend /etc/crontab "@reboot root sh -c 'chsh -s $SHELL root; sed -i \"/REMOVE_CHSH/d\" /etc/crontab' #REMOVE_CHSH"
+	echo "$(date) - Crontab now contains"
+	cat /etc/crontab
+	echo "$(date) - Changing shell from default to bash, will revert to ($SHELL) on reboot."
+	chsh -s /bin/bash root
+
+	echo "$(date) - Stopping services"
+
+	echo "$(date) - Stopping postgres"
+	service postgresql-9.3 stop
+
+
+	systemctl restart smartd.service
+
+	echo "$(date) - Stopping errata, including sshd and crond"
+	service ntpd stop
+	service ntpdate stop
+	service webmin stop
+	service sshd stop
+	service crond stop
+	service nfs stop
+
+
+
+	echo "$(date) - Shutting down anything that could be holding the root partition.  If some services show errors it is likely they are not running or do not exist - this is ok."
+	for SERVICE in `chkconfig --list | grep 3:on | awk '{print $1}' | grep -v -e sshd -e network -e rawdevices`; do service $SERVICE stop; done
+
+	
+
+
+
+	service rpcidmapd stop
+	setenforce 0
+	umount -a
+
+	############
+	## Configure RAM drive
+	########### #
+
+#/usr/share/dbus-1/system.conf
+
+	echo "$(date) - Copying temporary system to RAM drive"
+
+	##################################################################################################################################################################
+	## List of exclusions: unused kernels, locale, man, doc, wallpapers, backgrounds, valgrind, vmware-toole, another locale in /usr/lib, rpm dir, psql, yum, webmin + blanking mail files
+	##################################################################################################################################################################
+
+	rm -rf /tmp/tmproot
+	mkdir -p /tmp/tmproot; mount -t tmpfs -o size=$ramFileSystemSize tmpfs /tmp/tmproot; mkdir /tmp/tmproot/{proc,sys,usr,var,oldroot,root,tmp,lib}; mkdir /tmp/tmproot/var/lib; mkdir -p /tmp/tmproot/usr/local/bin; mkdir /tmp/tmproot/usr/libexec
+	cp -a /usr/libexec/grepconf.sh /tmp/tmproot/usr/libexec/ &> /dev/null; cp -ax /root/.ssh /tmp/tmproot/root/; cp -ax /{bin,mnt,sbin,lib64} /tmp/tmproot/; cp -ax /usr/{bin,sbin} /tmp/tmproot/usr/; cp -ax /usr/local/bin /tmp/tmproot/usr/local/; cp -ax /var/{account,empty,local,lock,nis,opt,preserve,run,spool,tmp,yp} /tmp/tmproot/var/;
+ 	mkdir -p /tmp/tmproot/extras; cp -ax /extras/bashLibraries /tmp/tmproot/extras/
+ 	mkdir -p /tmp/tmproot/var/log
+ 	#no noeed to copy locale, man or doc - they are not critical and will crowd up the drive
+ 	mkdir -p /tmp/tmproot/usr/share; find /usr/share  -maxdepth 1 -mindepth 1 -type d ! \( -name "locale" -o -name "man" -o -name "doc" -o -name "backgrounds" -o -name "wallpapers" \) -exec cp -ax {} /tmp/tmproot/usr/share \;
+ 	#only need to copy the kernel currently loaded, not the other kernels, which are quite large.  4.14.4 does not keep old kernels, but many older versions do
+ 	find /lib -maxdepth 1 -mindepth 1 -type d  ! \( -name "modules" \) -exec cp -ax {} /tmp/tmproot/lib \;
+ 	find /lib -maxdepth 1 -mindepth 1 -type f  -exec cp -ax {} /tmp/tmproot/lib \;
+	mkdir /tmp/tmproot/lib/modules; find /lib/modules -maxdepth 1 -iname "$(uname -r)" -exec cp -ax {} /tmp/tmproot/lib/modules \;
+	#block valgrind, when it occurs.  It is huge and not neeeded
+	mkdir /tmp/tmproot/usr/lib64; find /usr/lib64 -maxdepth 1 -mindepth 1 ! \( -name "valgrind" \) -exec cp -ax {} /tmp/tmproot/usr/lib64 \;
+	#vmware tools is big and not needed, same with: locale dir, the rpm dirs psql, and webmin ... these following lines could be an upgrade script enhancement whereas prior things would be found by the cleanup script, except for psql which i used to do a different way with xargs
+	mkdir /tmp/tmproot/usr/lib; find /usr/lib -maxdepth 1 -mindepth 1 ! \( -name "vmware-tools" -o -name "locale" \) -exec cp -ax {} /tmp/tmproot/usr/lib \;
+	mkdir /tmp/tmproot/var/lib; find /var/lib -maxdepth 1 -mindepth 1 ! \( -name "rpm" -o -name 'pgsql*' -o -name 'yum' -o -name 'rpmrebuilddb*' \) -exec cp -ax {} /tmp/tmproot/var/lib \;
+	mkdir /tmp/tmproot/etc; find /etc -maxdepth 1 -mindepth 1 ! \( -name "webmin" \) -exec cp -ax {} /tmp/tmproot/etc \;
+	echo > /tmp/tmproot/var/spool/mail/root; echo > /tmp/tmproot/var/spool/mail/rpc; echo > /tmp/tmproot/var/spool/mail/usb;
+	#copy only EN US locale
+	mkdir /tmp/tmproot/usr/share/locale/; cp -ax /usr/share/locale/en_US /tmp/tmproot/usr/share/locale; export LOCPATH=/usr/share/locale
+	#copy nano settings - without this word wrap is enabled and that is a no-go for coding
+	cp -fax /root/.nanorc /root/.nanohighlight /tmp/tmproot/root
+	#sfdisk.static is useful for many reasons in ramOS mode
+	
+	cp -fax /extras/sfdisk* /tmp/tmproot/extras/
+
+	if [ -f /root/partitions.info ]; then cp -ax /root/partitions.info /tmp/tmproot/root/; fi
+	echo 'ramOS' > /tmp/tmproot/root/machine.type
+	if [[ "$(getOS)" == 'centos7' ]]; then
+	  	echo "$(date) - Detected centos 7, so not copying dev"
+		mkdir /tmp/tmproot/{dev,run}
+	else
+	  echo "$(date) - Did not detect centos 7, so copying dev"
+	  cp -a /dev /tmp/tmproot/dev
+	fi
+
+	#postgres can be huge if the DB is big, you cannot copy it to the RAM dirve (thus grep -v pgsql)
+	#this is now done up with the find commands
+	#ls -1 /var/lib/ | grep -v pgsql | xargs -I {} cp -ax /var/lib/{} /tmp/tmproot/var/lib
+	echo "$(date) - Contents of tmp/tmproot are $(ls -lah /tmp/tmproot)"
+
+	echo "$(date) - Done copying filesystem"
+
+
+	############
+	## Pre-copy of files to the RAM drive 
+	############
+
+	### Script essentials
+
+	for fileCopy in "$@"; do
+		/bin/cp -fax "$fileCopy" /tmp/tmproot
+	done
+	echo "$(date) - Self copying to RAM drive, command will be: /bin/cp -fax \"${BASH_SOURCE[0]}\" /tmp/tmproot"
+	/bin/cp -fax "${BASH_SOURCE[0]}" /tmp/tmproot
+	echo "$(date) - Setting RAM OS file in /tmp/tmproot"
+	echo "true" > /tmp/tmproot/root/.motd_script.disable
+	echo "$(date) - Contents of /tmp/tmproot are now the following:"
+	ls -lah /tmp/tmproot
+
+
+	echo "$(date) - Recording IP address as ($ipAddress)"
+	echo "$ipAddress" > /tmp/ipaddress.temp
+
+	echo "$(date) - Current processes holding ($rootSystemPartitionMapping) are:"
+	fuser -vm $rootSystemPartitionMapping
+
+	echo "$(date) - Shutting down certain processes before pivot"
+	auditctl -D; sleep 0.1
+
+	service acpid stop; service auditd stop
+
+	#echo "$(date) - Binding existing OS directories to /tmp folder"
+	if [[ "$deviceOS" != 'centos6' ]]; then
+		#extra step needed as per modernization notes @ https://unix.stackexchange.com/questions/226872/how-to-shrink-root-filesystem-without-booting-a-livecd
+		echo "$(date) - Detected centos 7, so doing mount --make-rprivate /"
+		mount --make-rprivate /
+	fi
+
+	echo "$(date) - Shutting down swap drives prior to pivot"
+	swapoff -a
+	echo "$(date) - Doing OS pivot now"
+	#make sure sshd turns back on if we have to reboot
+    if [[ "$deviceOS" != 'centos6' ]]; then __serviceList="$(systemctl list-unit-files | grep enabled | grep -v sshd | grep .service | grep -oP '^[^ ]+')"; fi
+	chkconfig sshd on &> /dev/null; systemctl on sshd &> /dev/null; service auditd stop
+	umount /boot
+
+
+
+	mkdir -p /tmp/tmproot/oldroot &> /dev/null; sleep 0.1
+	pivot_root /tmp/tmproot /tmp/tmproot/oldroot; sleep 10
+	cd /
+	if [[ "$deviceOS" != 'centos6' ]]; then
+	#restart centos 7 services
+		systemctl restart atd.service
+		systemctl restart dbus-org.freedesktop.NetworkManager.service
+		systemctl restart postfix.service
+		systemctl restart iptables.service
+		systemctl restart kdump.service
+		systemctl restart lvm2-monitor.service
+		systemctl restart rhel-domainname.service
+		systemctl restart rhel-import-state.service
+		systemctl restart rhel-readonly.service
+		systemctl restart rsyslog.service
+		systemctl restart tuned.service
+	fi
+
+
+	sleep 2
+	echo "$(date) - After scanning for symlinks, decided to use ($scriptVar) as the script langauge.  Currently in directory ($(pwd))."
+	rm -f /ramOS.part2.log &> /dev/null
+	service sshd stop
+	$scriptVar -c "( ( /ramOS $__suppressExit \"$ramFileSystemSize\" part2  \"$deviceOS\" \"$ipAddress\" \"$rootSystemPartitionMapping\" \"$postExecCommand\" &> /ramOS.part2.log ) & )" &
+}
+
+function part2 {
+	local __suppressExit=''
+	if [[ "$1" == '--supressexit' ]]; then __suppressExit="$1"; shift; fi
+	sleep 1
+	echo "$(date) - Current processes holding ($rootSystemPartitionMapping) are:"
+	fuser -vm $rootSystemPartitionMapping
+	echo "Variables are: ramFileSystemSize ($ramFileSystemSize), deviceOS ($deviceOS), ipAddress ($ipAddress), rootSystemPartitionMapping ($rootSystemPartitionMapping), postExecCommand ($postExecCommand), __suppressExit ($__suppressExit)"
+	echo "$(date) - Re-mounting system directories"
+	if [[ "$deviceOS" != 'centos6' ]]; then
+		for i in dev proc sys run; do mount --move /oldroot/$i /$i; done
+	else
+		mount none /proc -t proc; mount none /sys -t sysfs; mount none /dev/pts -t devpts
+	fi
+	echo "$(date) - Starting unmount root"
+	unMountRoot $__suppressExit "$rootSystemPartitionMapping" /oldroot
+
+	if [[ "$deviceOS" == 'centos6' ]]; then service sshd restart
+	else
+		echo "$(date) - Restarting sshd"
+		/usr/sbin/sshd
+		echo "$(date) - Restarting sshd complete"
+	fi
+
+	echo "$(date) - mtab is now ($(cat /etc/mtab))"
+	rm -f /rw_test
+	echo -e '\n\tSYSTEM IS RAM OS MODE.  The hard drive is fully unmounted and you can access or modify it however you like!\n' >> /etc/issue.net
+
+}
+
+echo "$(date) - RAM OS script started ($partVar), PID is ($$)"
+if [[ "$partVar" == "part1" ]]; then 
+	part1 $suppressExit $@ | tee -a /var/log/ramOS.part1.log
+	#echo "DEBUG: directories current dir ($(pwd)):"
+	#echo "root"
+	#ls -lah /
+	#echo "oldroot"
+	#ls -lah /oldroot
+	#echo "oldroot var"
+	#ls -lah /oldroot/var
+	#echo "oldroot var log"
+	#ls -lah /oldroot/var/log/
+	#echo "var log"
+	#ls -lah /var/log
+	#echo "var"
+	#ls -lah /var
+
+	/bin/cp -f /oldroot/var/log/ramOS.part1.log /
+	echo "$(date) - RAM OS script exiting, this is part ($partVar)" &>> /ramOS.part1.log
+elif [[ "$partVar" == "part2" ]]; then 
+	part2 $suppressExit; 
+	if [[ "$postExecCommand" != "" ]]; then
+		echo "$(date) - Post-exec command is not empty, so will now execute: ($postExecCommand)"
+		$scriptVar -c "$postExecCommand"
+		#eval $postExecCommand actually worked with bash being loaded in
+		#$postExecCommand
+		echo "$(date) - Post-exec commmand complete."
+	else echo "$(date) - No post-exec command was entered ($postExecCommand).  Script will simply end."; fi
+fi
+echo "$(date) - RAM OS script exiting, this is part ($partVar)"
